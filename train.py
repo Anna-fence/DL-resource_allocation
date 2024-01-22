@@ -5,7 +5,10 @@ import sys
 import  matplotlib.pyplot as plt 
 from collections import  deque
 import os
-import tensorflow as tf
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import torch.nn.functional as F
 import time
 
 TIME_SLOTS = 100000                            # number of time-slots to run simulation
@@ -13,28 +16,32 @@ NUM_CHANNELS = 2                               # Total number of channels
 NUM_USERS = 3                                  # Total number of users
 ATTEMPT_PROB = 1                               # attempt probability of ALOHA based  models 
 
-#It creates a one hot vector of a number as num with size as len
-def one_hot(num,len):
-    assert num >=0 and num < len ,"error"
-    vec = np.zeros([len],np.int32)
+# define a function for one-hot encoding
+def one_hot(num, size):
+    vec = np.zeros(size, dtype=int)
     vec[num] = 1
     return vec
 
-
-
-#generates next-state from action and observation
+# generates next-state from action and observation
 def state_generator(action,obs):
     input_vector = []
     if action is None:
         print ('None')
         sys.exit()
     for user_i in range(action.size):
-        input_vector_i = one_hot(action[user_i],NUM_CHANNELS+1)
+        input_vector_i = one_hot(action[user_i], NUM_CHANNELS + 1)
         channel_alloc = obs[-1]
         input_vector_i = np.append(input_vector_i,channel_alloc)
         input_vector_i = np.append(input_vector_i,int(obs[user_i][0]))    #ACK
         input_vector.append(input_vector_i)
     return input_vector
+
+# set the random seed
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
 
 memory_size = 1000                      #size of experience replay deque
 batch_size = 6                          # Num of batches to train at each time_slot
@@ -52,14 +59,17 @@ action_size = NUM_CHANNELS+1            #length of output  (k+1)
 alpha=0                                 #co-operative fairness constant
 beta = 1                                #Annealing constant for Monte - Carlo
 
-# reseting default tensorflow computational graph
-tf.reset_default_graph()
+set_seed(0)
+
 
 #initializing the environment
 env = env_network(NUM_USERS,NUM_CHANNELS,ATTEMPT_PROB)
 
 #initializing deep Q network
 mainQN = QNetwork(name='main',hidden_size=hidden_size,learning_rate=learning_rate,step_size=step_size,state_size=state_size,action_size=action_size)
+
+# initializing the optimizer
+optimizer = optim.Adam(mainQN.parameters(), lr=learning_rate)
 
 #this is experience replay buffer(deque) from which each batch will be sampled and fed to the neural network for training
 memory = Memory(max_size=memory_size)   
@@ -70,7 +80,6 @@ history_input = deque(maxlen=step_size)
 #to sample random actions for each user
 action  =  env.sample()
 
-#
 obs = env.step(action)
 state = state_generator(action,obs)
 reward = [i[1] for i in obs[:NUM_USERS]]
@@ -214,13 +223,7 @@ def get_next_states_user(batch):
 interval = 1       # debug interval
 
 # saver object to save the checkpoints of the DQN to disk
-saver = tf.train.Saver()
-
-#initializing the session
-sess = tf.Session()
-
-#initialing all the tensorflow variables
-sess.run(tf.global_variables_initializer())
+torch.save(mainQN.state_dict(), './checkpoints/dqn_multi-user.ckpt')
 
 
 #list of total rewards
@@ -257,29 +260,26 @@ for time_step in range(TIME_SLOTS):
     else:
         #initializing action vector
         action = np.zeros([NUM_USERS],dtype=np.int32)
-
-        #converting input history into numpy array
-        state_vector = np.array(history_input)
+        #converting input history into tensor
+        state_vector = torch.tensor(history_input)
 
         #print np.array(history_input)
         print ("///////////////")
 
         for each_user in range(NUM_USERS):
+            # feeding the input-history-sequence of (t-1) slot for each user seperately
+            feed = state_vector[:, each_user].reshape(1, step_size, state_size)
+            # predicting Q-values of state respectively
+            Qs = mainQN(feed.float())
+            # print Qs
             
-            #feeding the input-history-sequence of (t-1) slot for each user seperately
-            feed = {mainQN.inputs_:state_vector[:,each_user].reshape(1,step_size,state_size)}
-
-            #predicting Q-values of state respectively
-            Qs = sess.run(mainQN.output,feed_dict=feed) 
-            #print Qs
-
             #   Monte-carlo sampling from Q-values  (Boltzmann distribution)
             ##################################################################################
-            prob1 = (1-alpha)*np.exp(beta*Qs)
+            prob1 = (1-alpha)*np.exp(beta*Qs.detach().numpy())
 
             # Normalizing probabilities of each action  with temperature (beta) 
-            prob = prob1/np.sum(np.exp(beta*Qs)) + alpha/(NUM_CHANNELS+1)
-            #print prob 
+            prob = prob1/np.sum(np.exp(beta*Qs.detach().numpy())) + alpha/(NUM_CHANNELS+1)
+            # print prob 
 
             #   This equation is as given in the paper :
             #   Deep Multi-User Reinforcement Learning for  
@@ -288,13 +288,13 @@ for time_step in range(TIME_SLOTS):
             ########################################################################################
 
             #  choosing action with max probability
-            action[each_user] = np.argmax(prob,axis=1)
+            action[each_user] = np.argmax(prob, axis=1)
 
             #action[each_user] = np.argmax(Qs,axis=1)
             if time_step % interval == 0:
                 print (state_vector[:,each_user])
                 print (Qs)
-                print (prob, np.sum(np.exp(beta*Qs)))
+                print (prob, np.sum(np.exp(beta*Qs.detach().numpy())))
 
     # taking action as predicted from the q values and receiving the observation from thr envionment
     obs = env.step(action)           # obs is a list of tuple with [(ACK,REW) for each user ,(CHANNEL_RESIDUAL_CAPACITY_VECTOR)] 
@@ -375,17 +375,17 @@ for time_step in range(TIME_SLOTS):
     next_states = np.reshape(next_states,[-1,next_states.shape[2],next_states.shape[3]])
 
     #  creating target vector (possible best action)
-    target_Qs = sess.run(mainQN.output,feed_dict={mainQN.inputs_:next_states})
-
+    target_Qs = mainQN(torch.tensor(next_states, dtype=torch.float32))
 
     #  Q_target =  reward + gamma * Q_next
-    targets = rewards[:,-1] + gamma * np.max(target_Qs,axis=1)
-  
+    targets = rewards[:, -1] + gamma * np.max(target_Qs.detach().numpy(), axis=1)
+
     #  calculating loss and train using Adam  optimizer 
-    loss, _ = sess.run([mainQN.loss,mainQN.opt],
-                            feed_dict={mainQN.inputs_:states,
-                            mainQN.targetQs_:targets,
-                            mainQN.actions_:actions[:,-1]})
+    optimizer.zero_grad()
+    outputs = mainQN(torch.tensor(states, dtype=torch.float32))
+    loss = F.l1_loss(outputs.gather(1, torch.tensor(actions[:, -1]).unsqueeze(1).long()), torch.tensor(targets).unsqueeze(1))
+    loss.backward()
+    optimizer.step()
     
 
     #   Training block ends
@@ -413,7 +413,7 @@ for time_step in range(TIME_SLOTS):
         total_rewards = []
         cum_r = [0]
         cum_collision = [0]
-        saver.save(sess,'checkpoints/dqn_multi-user.ckpt')
+        torch.save(mainQN.state_dict(), './checkpoints/dqn_multi-user.ckpt')
         #print time_step,loss , sum(reward) , Qs
     
     print ("*************************************************")
