@@ -408,6 +408,7 @@ for time_step in range(TIME_SLOTS):
         plt.xlabel('Time Slot')
         plt.ylabel('Cumulative reward of all users')
         #plt.title('Cumulative reward of all users')
+        plt.savefig('./plots/dqn_multi-user.png')
         plt.show()
         
         total_rewards = []
