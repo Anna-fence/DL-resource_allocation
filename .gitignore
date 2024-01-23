@@ -1,1 +1,4 @@
 /drqn.pyc
+checkpoints/*.*
+__pycache__/*.*
+plots/*.*
